@@ -29,6 +29,7 @@ enum PacketType {
   CLOSE_REQ = 2;
   CLOSE_RSP = 3;
   DATA = 4;
+  DATA_ACK = 5;
 }
 
 enum Error {
@@ -45,6 +46,7 @@ message Packet {
     Data data = 4;
     CloseRequest closeRequest = 5;
     CloseResponse closeResponse = 6;
+    DataAck dataAck = 7;
   }
 }
 
@@ -57,6 +59,9 @@ message DialRequest {
 
     // random id for client, maybe should be longer
     int64 random = 3;
+
+    // window size for flow control
+    int64 windowSize = 4;
 }
 
 message DialResponse {
@@ -68,6 +73,9 @@ message DialResponse {
 
     // random copied from DialRequest
     int64 random = 3;
+
+    // window size for flow control
+    int64 windowSize = 4;
 }
 
 message CloseRequest {
@@ -92,4 +100,9 @@ message Data {
 
     // stream data
     bytes data = 3;
+}
+
+message DataAck {
+    // connectID to connect to
+    int64 connectID = 1;
 }

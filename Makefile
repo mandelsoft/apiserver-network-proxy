@@ -89,7 +89,9 @@ lint:
 ## --------------------------------------
 
 .PHONY: gen
-gen: proto/agent/agent.pb.go konnectivity-client/proto/client/client.pb.go mock_gen
+gen: proto_gen mock_gen
+
+proto_gen: proto/agent/agent.pb.go konnectivity-client/proto/client/client.pb.go
 
 konnectivity-client/proto/client/client.pb.go: konnectivity-client/proto/client/client.proto
 	protoc -I . konnectivity-client/proto/client/client.proto --go_out=plugins=grpc:${GOPATH}/src

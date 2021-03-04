@@ -27,12 +27,15 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/sync/semaphore"
 	"google.golang.org/grpc/metadata"
 	authv1 "k8s.io/api/authentication/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
+
 	"sigs.k8s.io/apiserver-network-proxy/konnectivity-client/proto/client"
 	pkgagent "sigs.k8s.io/apiserver-network-proxy/pkg/agent"
+	"sigs.k8s.io/apiserver-network-proxy/pkg/common"
 	"sigs.k8s.io/apiserver-network-proxy/pkg/server/metrics"
 	"sigs.k8s.io/apiserver-network-proxy/pkg/util"
 	"sigs.k8s.io/apiserver-network-proxy/proto/agent"
@@ -46,6 +49,8 @@ type ProxyClientConnection struct {
 	Grpc      client.ProxyService_ProxyServer
 	HTTP      net.Conn
 	connected chan struct{}
+	in        chan client.Packet
+	flow      *semaphore.Weighted
 	connectID int64
 	agentID   string
 	start     time.Time
@@ -57,25 +62,69 @@ const (
 )
 
 func (c *ProxyClientConnection) send(pkt *client.Packet) error {
-	if c.Mode == "grpc" {
-		stream := c.Grpc
-		return stream.Send(pkt)
-	} else if c.Mode == "http-connect" {
-		if pkt.Type == client.PacketType_CLOSE_RSP {
-			return c.HTTP.Close()
-		} else if pkt.Type == client.PacketType_DATA {
-			_, err := c.HTTP.Write(pkt.GetData().Data)
-			return err
-		} else if pkt.Type == client.PacketType_DIAL_RSP {
-			if pkt.GetDialResponse().Error != "" {
-				return c.HTTP.Close()
-			}
-			return nil
-		} else {
-			return fmt.Errorf("attempt to send via unrecognized connection type %v", pkt.Type)
+	switch pkt.Type {
+	case client.PacketType_DATA_ACK:
+		c.flow.Release(1)
+		return nil
+	case client.PacketType_DIAL_RSP:
+		if c.Mode == "grpc" {
+			stream := c.Grpc
+			return stream.Send(pkt)
 		}
-	} else {
-		return fmt.Errorf("attempt to send via unrecognized connection mode %q", c.Mode)
+		c.in = make(chan client.Packet, common.WINDOW_SIZE)
+		c.flow = semaphore.NewWeighted(pkt.GetDialResponse().WindowSize - 1)
+		go c.serveFrontend()
+	}
+
+	klog.V(4).InfoS("buffering packet", "connID", c.connectID)
+	c.in <- *pkt
+	switch pkt.Type {
+	case client.PacketType_CLOSE_RSP:
+		close(c.in)
+	}
+	return nil
+}
+
+func (c *ProxyClientConnection) serveFrontend() {
+	klog.V(4).InfoS("Running frontend", "connID", c.connectID)
+
+	for pkt := range c.in {
+		switch pkt.Type {
+		case client.PacketType_DATA:
+			klog.V(4).InfoS("Sending DATA_ACK", "connID", c.connectID)
+			packet := &client.Packet{
+				Type: client.PacketType_DATA_ACK,
+				Payload: &client.Packet_DataAck{
+					DataAck: &client.DataAck{
+						ConnectID: c.connectID,
+					},
+				},
+			}
+			c.backend.Send(packet)
+		}
+		var err error
+		if c.Mode == "grpc" {
+			stream := c.Grpc
+			err = stream.Send(&pkt)
+		} else if c.Mode == "http-connect" {
+			if pkt.Type == client.PacketType_CLOSE_RSP {
+				err = c.HTTP.Close()
+			} else if pkt.Type == client.PacketType_DATA {
+				_, err = c.HTTP.Write(pkt.GetData().Data)
+			} else if pkt.Type == client.PacketType_DIAL_RSP {
+				if pkt.GetDialResponse().Error != "" {
+					err = c.HTTP.Close()
+				}
+			} else {
+				err = fmt.Errorf("attempt to send via unrecognized connection type %v", pkt.Type)
+			}
+		} else {
+			err = fmt.Errorf("attempt to send via unrecognized connection mode %q", c.Mode)
+		}
+		if err != nil {
+			klog.ErrorS(err, "sending to frontend failed: %s", err)
+			break
+		}
 	}
 }
 
@@ -367,6 +416,7 @@ func (s *ProxyServer) serveRecvFrontend(stream client.ProxyService_ProxyServer, 
 	// The first packet should be a DIAL_REQ, we will randomly get a
 	// backend from the BackendManger then.
 	var backend Backend
+	var frontend *ProxyClientConnection
 	var err error
 
 	for pkt := range recvCh {
@@ -389,15 +439,15 @@ func (s *ProxyServer) serveRecvFrontend(stream client.ProxyService_ProxyServer, 
 				// The Dial is failing; no reason to keep this goroutine.
 				return
 			}
+			frontend = &ProxyClientConnection{
+				Mode:      "grpc",
+				Grpc:      stream,
+				connected: make(chan struct{}),
+				start:     time.Now(),
+				backend:   backend,
+			}
 			s.PendingDial.Add(
-				pkt.GetDialRequest().Random,
-				&ProxyClientConnection{
-					Mode:      "grpc",
-					Grpc:      stream,
-					connected: make(chan struct{}),
-					start:     time.Now(),
-					backend:   backend,
-				})
+				pkt.GetDialRequest().Random, frontend)
 			if err := backend.Send(pkt); err != nil {
 				klog.ErrorS(err, "DIAL_REQ to Backend failed")
 			}
@@ -430,6 +480,7 @@ func (s *ProxyServer) serveRecvFrontend(stream client.ProxyService_ProxyServer, 
 				klog.V(2).InfoS("Backend has not been initialized for the connection. Client should send a Dial Request first", "connectionID", connID)
 				continue
 			}
+			frontend.flow.Acquire(context.Background(), 1)
 			if err := backend.Send(pkt); err != nil {
 				// TODO: retry with other backends connecting to this agent.
 				klog.ErrorS(err, "DATA to Backend failed")
@@ -462,6 +513,7 @@ func (s *ProxyServer) serveRecvFrontend(stream client.ProxyService_ProxyServer, 
 	}
 }
 
+/*
 func (s *ProxyServer) serveSend(stream client.ProxyService_ProxyServer, sendCh <-chan *client.Packet) {
 	klog.V(4).Infoln("start serve send ...")
 	for pkt := range sendCh {
@@ -471,6 +523,7 @@ func (s *ProxyServer) serveSend(stream client.ProxyService_ProxyServer, sendCh <
 		}
 	}
 }
+*/
 
 func agentID(stream agent.AgentService_ConnectServer) (string, error) {
 	md, ok := metadata.FromIncomingContext(stream.Context())
@@ -645,9 +698,7 @@ func (s *ProxyServer) serveRecvBackend(backend Backend, stream agent.AgentServic
 				},
 			}
 			pkt.GetCloseResponse().ConnectID = frontend.connectID
-			if err := frontend.send(pkt); err != nil {
-				klog.ErrorS(err, "CLOSE_RSP to frontend failed")
-			}
+			frontend.send(pkt)
 		}
 	}()
 
@@ -655,10 +706,10 @@ func (s *ProxyServer) serveRecvBackend(backend Backend, stream agent.AgentServic
 		switch pkt.Type {
 		case client.PacketType_DIAL_RSP:
 			resp := pkt.GetDialResponse()
-			klog.V(5).InfoS("Received DIAL_RSP", "random", resp.Random, "agentID", agentID, "connectionID", resp.ConnectID)
+			klog.V(4).InfoS("Received DIAL_RSP", "random", resp.Random, "agentID", agentID, "connectionID", resp.ConnectID, "windowSize", resp.WindowSize)
 
 			if frontend, ok := s.PendingDial.Get(resp.Random); !ok {
-				klog.V(5).Infoln("DIAL_RSP not recognized; dropped")
+				klog.V(4).Infoln("DIAL_RSP not recognized; dropped")
 			} else {
 				dialErr := false
 				if resp.Error != "" {
@@ -684,34 +735,34 @@ func (s *ProxyServer) serveRecvBackend(backend Backend, stream agent.AgentServic
 
 		case client.PacketType_DATA:
 			resp := pkt.GetData()
-			klog.V(5).InfoS("Received data from agent", "bytes", len(resp.Data), "agentID", agentID, "connectionID", resp.ConnectID)
+			klog.V(4).InfoS("Received data from agent", "bytes", len(resp.Data), "agentID", agentID, "connectionID", resp.ConnectID)
 			frontend, err := s.getFrontend(agentID, resp.ConnectID)
 			if err != nil {
 				klog.ErrorS(err, "could not get frontent client")
 				break
 			}
-			if err := frontend.send(pkt); err != nil {
-				klog.ErrorS(err, "send to client stream failure")
-			} else {
-				klog.V(5).InfoS("DATA sent to frontend")
+			frontend.send(pkt)
+		case client.PacketType_DATA_ACK:
+			resp := pkt.GetDataAck()
+			klog.V(4).InfoS("Received data ack from agent", "agentID", agentID, "connectionID", resp.ConnectID)
+			frontend, err := s.getFrontend(agentID, resp.ConnectID)
+			if err != nil {
+				klog.ErrorS(err, "could not get frontent client")
+				break
 			}
+			frontend.send(pkt)
 
 		case client.PacketType_CLOSE_RSP:
 			resp := pkt.GetCloseResponse()
-			klog.V(5).InfoS("Received CLOSE_RSP", "connectionID", resp.ConnectID)
+			klog.V(4).InfoS("Received CLOSE_RSP", "connectionID", resp.ConnectID)
 			frontend, err := s.getFrontend(agentID, resp.ConnectID)
 			if err != nil {
 				klog.ErrorS(err, "could not get frontent client")
 				break
 			}
-			if err := frontend.send(pkt); err != nil {
-				// Normal when frontend closes it.
-				klog.ErrorS(err, "CLOSE_RSP send to client stream error")
-			} else {
-				klog.V(5).Infoln("CLOSE_RSP sent to frontend")
-			}
+			frontend.send(pkt)
 			s.removeFrontend(agentID, resp.ConnectID)
-			klog.V(5).InfoS("Close streaming", "agentID", agentID, "connectionID", resp.ConnectID)
+			klog.V(4).InfoS("Close streaming", "agentID", agentID, "connectionID", resp.ConnectID)
 
 		default:
 			klog.V(2).InfoS("Unrecognized packet", "packet", pkt)
